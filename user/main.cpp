@@ -13,6 +13,7 @@
 #define OP_CMD_READ 0x400011
 #define OP_CMD_WRITE 0x400012
 #define OP_CMD_LISTMAP 0x400013
+#define OP_CMD_ROOT 0x400014
 
 
 struct MEMORY {
@@ -75,10 +76,15 @@ int main() {
     MEMORY mem{};
     Device dev;
     if (dev.init()) {
+        // mem.pid = 16146;
+        // res = dev.call(OP_CMD_ROOT, &mem);
+        // return 0;
         mem.pid = getpid();
         res = dev.call(OP_CMD_LISTMAP, &mem);
         std::cout << read_proc_kmem(mem.pid) << std::endl;
         printf("pid: %d\n", mem.pid);
+
+
         char read_buffer[100]{0};
         mem.buffer = read_buffer;
         mem.addr = (intptr_t) hello;

